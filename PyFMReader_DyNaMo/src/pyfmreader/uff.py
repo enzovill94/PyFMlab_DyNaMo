@@ -18,6 +18,7 @@ from .ardf.loadARDFimg import loadARDFimg
 from .ardf.loadibwcurve import loadIBWcurve
 from .load_uff import loadUFFcurve
 from .save_uff import saveUFFtxt
+#  from .ps_nex.loadpsneximg import loadPSNEXimg
 
 
 class UFF:
@@ -45,6 +46,7 @@ class UFF:
         # FV Specific Atribtues
         self.isFV = None
         self.piezoimg = None
+        self.df_map = None  # PS-NEX specific: DataFrame with curve mappings
         # In files like JPK scans you may
         # have additional image data.
         self.imagedata = None
@@ -168,6 +170,7 @@ class UFF:
 
                 Returns:
                         piezoimg (np.array): 2D array containing the piezo image of the file.
+                        df_map (pd.DataFrame): DataFrame with curve mappings (PS-NEX only, None for others).
         """
         file_type = self.filemetadata['file_type']
         if file_type in jpkfiles:
@@ -178,10 +181,88 @@ class UFF:
             self.piezoimg = loadNANOSCimg(self.filemetadata)
         elif file_type in psnexfiles:
             from .ps_nex.loadpsneximg import loadPSNEXimg
-            self.piezoimg, _ = loadPSNEXimg(self)
+            self.piezoimg, self.df_map = loadPSNEXimg(self)
         elif file_type in ARDFfiles:
             self.piezoimg = loadARDFimg(self.filemetadata)
-        return self.piezoimg
+        return self.piezoimg, self.df_map
+
+    def getcurve_by_index(self, curve_index, z_sensor_delay=0, bool_correct_overshoot=False):
+        """
+        Load a single force curve from a PS-NEX map by curve_index from df_map.
+        
+        This method links getcurve() with df_map by using the curve_index to look up
+        the corresponding TDMS file path and load the curve data. This is particularly
+        useful for PS-NEX maps where each curve is stored in a separate TDMS file.
+        
+        The method first checks if df_map is available (call getpiezoimg() first if not).
+        Then uses the curve_index to find the corresponding file and loads the force curve.
+        
+        Parameters:
+        -----------
+        curve_index : int
+            The curve index to load (must exist in df_map). This is typically a value 
+            between 0 and len(df_map)-1.
+        z_sensor_delay : float, optional
+            Z sensor delay value. Default is 0.
+        bool_correct_overshoot : bool, optional
+            Flag indicating whether to correct overshoot. Default is False.
+        
+        Returns:
+        --------
+        force_curve : utils.forcecurve.ForceCurve
+            The loaded force curve object
+        metadata : dict
+            Metadata from the loaded TDMS file
+        filepath : str
+            Path to the TDMS file that was loaded
+        
+        Raises:
+        -------
+        ValueError
+            If df_map is not available or curve_index is not found in df_map
+        RuntimeError
+            If file type is not PS-NEX
+        
+        Examples:
+        ---------
+        >>> # Load piezo image and df_map first
+        >>> piezoimg, df_map = uff_map.getpiezoimg()
+        >>> 
+        >>> # Load a specific curve by index
+        >>> fc, metadata, filepath = uff_map.getcurve_by_index(curve_index=5)
+        >>> 
+        >>> # With overshoot correction
+        >>> fc, metadata, filepath = uff_map.getcurve_by_index(
+        ...     curve_index=5, 
+        ...     bool_correct_overshoot=True
+        ... )
+        """
+        # Check if df_map exists
+        if self.df_map is None:
+            raise ValueError(
+                "df_map not available. Call getpiezoimg() first to load the map data."
+            )
+        
+        # Check file type
+        file_type = self.filemetadata['file_type']
+        if file_type not in psnexfiles:
+            raise RuntimeError(
+                f"getcurve_by_index() is only supported for PS-NEX files. "
+                f"Current file type: {file_type}"
+            )
+        
+        # Import the helper function
+        from .ps_nex.loadpsnexcurve import loadPSNEXcurve_by_index
+        
+        # Load the curve using the helper function
+        force_curve, metadata, filepath = loadPSNEXcurve_by_index(
+            self.df_map,
+            curve_index,
+            z_sensor_delay=z_sensor_delay,
+            bool_correct_overshoot=bool_correct_overshoot
+        )
+        
+        return force_curve, metadata, filepath
 
     def to_txt(self, savedir):
         """

@@ -1,7 +1,7 @@
-import PyQt5
-from pyqtgraph.Qt import QtGui, QtWidgets, QtCore
+from pyqtgraph.Qt import QtWidgets
 import pyqtgraph as pg
 import numpy as np
+import logging
 from pyqtgraph.parametertree import Parameter, ParameterTree
 
 import pyfmgui.const as cts
@@ -48,6 +48,23 @@ class DataViewerWidget(QtWidgets.QWidget):
         self.paramTree = ParameterTree()
         self.paramTree.setParameters(self.params, showTop=False)
 
+        self.psnex_nav_widget = QtWidgets.QWidget(self)
+        self.psnex_nav_layout = QtWidgets.QHBoxLayout(self.psnex_nav_widget)
+        self.psnex_nav_layout.setContentsMargins(0, 0, 0, 0)
+        self.psnex_nav_layout.setSpacing(6)
+        self.psnex_nav_label = QtWidgets.QLabel("PS-NEX Curve", self.psnex_nav_widget)
+        self.psnex_curve_combo = QtWidgets.QComboBox(self.psnex_nav_widget)
+        self.psnex_prev_button = QtWidgets.QPushButton("Prev", self.psnex_nav_widget)
+        self.psnex_next_button = QtWidgets.QPushButton("Next", self.psnex_nav_widget)
+        self.psnex_curve_combo.currentIndexChanged.connect(self.psnex_curve_changed)
+        self.psnex_prev_button.clicked.connect(lambda: self.step_psnex_curve(-1))
+        self.psnex_next_button.clicked.connect(lambda: self.step_psnex_curve(1))
+        self.psnex_nav_layout.addWidget(self.psnex_nav_label)
+        self.psnex_nav_layout.addWidget(self.psnex_prev_button)
+        self.psnex_nav_layout.addWidget(self.psnex_next_button)
+        self.psnex_nav_layout.addWidget(self.psnex_curve_combo, 1)
+        self.psnex_nav_widget.setVisible(False)
+
         self.l = pg.GraphicsLayoutWidget()
 
         ## Add 3 plots into the first row (automatic position)
@@ -77,8 +94,64 @@ class DataViewerWidget(QtWidgets.QWidget):
         layout.addWidget(self.tree, 0, 0, 1, 1)
         layout.addWidget(self.metadata_tree, 0, 1, 1, 1)
         layout.addWidget(self.paramTree, 0, 2, 1, 1)
-        layout.addWidget(self.l, 1, 0, 1, 3)
+        layout.addWidget(self.psnex_nav_widget, 1, 0, 1, 3)
+        layout.addWidget(self.l, 2, 0, 1, 3)
         layout.setColumnStretch(1, 4)
+
+    def populate_psnex_curve_selector(self):
+        self.psnex_curve_combo.blockSignals(True)
+        self.psnex_curve_combo.clear()
+
+        current_file = getattr(self.session, 'current_file', None)
+        if current_file is None or current_file.filemetadata['file_type'] not in cts.psnex_file_extension:
+            self.psnex_nav_widget.setVisible(False)
+            self.psnex_curve_combo.blockSignals(False)
+            return
+
+        df_map = current_file.df_map
+        if df_map is None or df_map.empty:
+            self.psnex_nav_widget.setVisible(False)
+            self.psnex_curve_combo.blockSignals(False)
+            return
+
+        if 'curve_index' not in df_map.columns:
+            self.psnex_nav_widget.setVisible(False)
+            self.psnex_curve_combo.blockSignals(False)
+            return
+
+        self.psnex_nav_widget.setVisible(True)
+        for _, row in df_map.sort_values('curve_index').iterrows():
+            curve_index = int(row['curve_index'])
+            file_id = str(row.get('file_id', ''))
+            x_idx = row.get('x_index', '')
+            y_idx = row.get('y_index', '')
+            label = f"{curve_index} | {file_id} | ({x_idx}, {y_idx})"
+            self.psnex_curve_combo.addItem(label, curve_index)
+
+        target_curve_index = getattr(self.session, 'current_curve_index', 0)
+        combo_index = self.psnex_curve_combo.findData(target_curve_index)
+        if combo_index < 0:
+            combo_index = 0
+        self.psnex_curve_combo.setCurrentIndex(combo_index)
+        self.psnex_curve_combo.blockSignals(False)
+
+    def psnex_curve_changed(self, combo_index):
+        current_file = getattr(self.session, 'current_file', None)
+        if current_file is None or current_file.filemetadata['file_type'] not in cts.psnex_file_extension:
+            return
+
+        curve_index = self.psnex_curve_combo.itemData(combo_index)
+        if curve_index is None:
+            return
+
+        self.session.current_curve_index = int(curve_index)
+        self.updateCurve()
+
+    def step_psnex_curve(self, delta):
+        if self.psnex_curve_combo.count() == 0:
+            return
+        next_index = max(0, min(self.psnex_curve_combo.count() - 1, self.psnex_curve_combo.currentIndex() + delta))
+        self.psnex_curve_combo.setCurrentIndex(next_index)
     
     def mouseMoved(self,event):
         vb = self.plotItem.vb
@@ -88,7 +161,11 @@ class DataViewerWidget(QtWidgets.QWidget):
             pixels = vb.mapFromViewToItem(self.correlogram, items)
             x, y = int(pixels.x()), int(pixels.y())
             self.ROI.setPos(x, y)
-            self.session.current_curve_index = self.session.map_coords[x,y]
+            if self.session.current_file and self.session.current_file.filemetadata['file_type'] in cts.psnex_file_extension:
+                if self.session.map_coords is not None and 0 <= y < self.session.map_coords.shape[0] and 0 <= x < self.session.map_coords.shape[1]:
+                    self.session.current_curve_index = self.session.map_coords[y, x]
+            else:
+                self.session.current_curve_index = self.session.map_coords[x, y]
             self.updateCurve()
             if self.session.hertz_fit_widget:
                 self.session.hertz_fit_widget.updatePlots()
@@ -177,7 +254,27 @@ class DataViewerWidget(QtWidgets.QWidget):
             deflection_sens = self.session.current_file.filemetadata['defl_sens_nmbyV'] / 1e9
         else:
             deflection_sens = self.session.global_involts
-        force_curve = self.session.current_file.getcurve(idx, bool_correct_overshoot = self.correct_app.value())
+
+        file_type = self.session.current_file.filemetadata['file_type']
+        if file_type in cts.psnex_file_extension:
+            # For PS-NEX maps, each curve is stored in a separate TDMS file.
+            # Use map index lookup through df_map instead of direct getcurve(idx).
+            if self.session.current_file.df_map is not None:
+                force_curve, _, _ = self.session.current_file.getcurve_by_index(
+                    idx,
+                    bool_correct_overshoot=self.correct_app.value()
+                )
+            else:
+                force_curve = self.session.current_file.getcurve(
+                    idx,
+                    bool_correct_overshoot=self.correct_app.value()
+                )
+        else:
+            force_curve = self.session.current_file.getcurve(
+                idx,
+                bool_correct_overshoot=self.correct_app.value()
+            )
+
         force_curve.preprocess_force_curve(deflection_sens, height_channel)
         if self.session.current_file.filemetadata['file_type'] in cts.jpk_file_extensions:
             force_curve.shift_height()
@@ -202,6 +299,17 @@ class DataViewerWidget(QtWidgets.QWidget):
             self.plotItem.setLabel('bottom', 'x pixels')
             self.plotItem.addItem(self.ROI)
             self.plotItem.scene().sigMouseClicked.connect(self.mouseMoved)
+
+            # Ensure FV image data is available before plotting.
+            if self.session.current_file.piezoimg is None and \
+                self.session.current_file.filemetadata['file_type'] in (
+                    cts.nanoscope_file_extensions + cts.asylum_file_extensions + cts.psnex_file_extension
+                ):
+                try:
+                    self.session.current_file.getpiezoimg()
+                except Exception as error:
+                    logging.getLogger().warning(f"Failed to compute piezo image: {error}")
+
             # create transform to center the corner element on the origin, for any assigned image:
             if self.session.current_file.filemetadata['file_type'] in cts.jpk_file_extensions:
                 img = self.session.current_file.imagedata.get('Height(measured)', None)
@@ -218,6 +326,11 @@ class DataViewerWidget(QtWidgets.QWidget):
                 curve_coords = np.rot90(np.fliplr(curve_coords))
             elif self.session.current_file.filemetadata['file_type'] in cts.nanoscope_file_extensions+cts.asylum_file_extensions:
                 img = self.session.current_file.piezoimg
+                if img is None:
+                    self.plotItem.setTitle("Piezo Height unavailable")
+                    self.metadata_tree.setData(summarize_metadata(self.session.current_file.filemetadata))
+                    self.l.addItem(self.p1)
+                    return
                 img = np.rot90(np.fliplr(img))
 
                 self.plotItem.setTitle("Piezo Height (μm)")
@@ -228,10 +341,26 @@ class DataViewerWidget(QtWidgets.QWidget):
             
             elif self.session.current_file.filemetadata['file_type'] in cts.psnex_file_extension:
                 img = self.session.current_file.piezoimg
+                if img is None:
+                    self.plotItem.setTitle("Piezo Height unavailable")
+                    self.metadata_tree.setData(summarize_metadata(self.session.current_file.filemetadata))
+                    self.l.addItem(self.p1)
+                    return
+                img = img[:, :, 0]
                 self.plotItem.setTitle("Piezo Height (μm)")
                 shape = img.shape
                 rows, cols = shape[0], shape[1]
-                curve_coords = np.arange(cols*rows).reshape((cols, rows))
+                curve_coords = np.full((rows, cols), -1, dtype=int)
+
+                df_map = self.session.current_file.df_map
+                if df_map is not None and {'x_index', 'y_index', 'curve_index'}.issubset(df_map.columns):
+                    for _, row in df_map.iterrows():
+                        x_idx = int(row['x_index'])
+                        y_idx = int(row['y_index'])
+                        if 0 <= x_idx < cols and 0 <= y_idx < rows:
+                            curve_coords[y_idx, x_idx] = int(row['curve_index'])
+                else:
+                    curve_coords = np.arange(cols * rows).reshape((rows, cols))
 
             elif self.session.current_file.filemetadata['file_type'] in cts.jpk_h5_file:
                 #img = self.session.current_file.piezoimg
@@ -261,8 +390,14 @@ class DataViewerWidget(QtWidgets.QWidget):
         self.l.addItem(self.p1)
 
         self.metadata_tree.setData(summarize_metadata(self.session.current_file.filemetadata))
-        
-        self.session.current_curve_index = 0
+        self.populate_psnex_curve_selector()
+
+        if self.session.current_file.filemetadata['file_type'] in cts.psnex_file_extension:
+            current_curve_index = self.psnex_curve_combo.currentData()
+            if current_curve_index is not None:
+                self.session.current_curve_index = int(current_curve_index)
+        else:
+            self.session.current_curve_index = 0
         self.ROI.setPos(0, 0)
         self.updateCurve()
 

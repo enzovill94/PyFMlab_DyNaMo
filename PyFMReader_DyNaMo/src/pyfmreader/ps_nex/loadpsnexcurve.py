@@ -11,6 +11,7 @@ Created on Thu Apr  7 10:55:32 2026
 # from struct import unpack
 # from itertools import groupby
 import numpy as np
+import pandas as pd
 from nptdms import TdmsFile
 
 from ..utils.forcecurve import ForceCurve
@@ -22,6 +23,50 @@ import logging
 logger = logging.getLogger(__name__)
 #from pyfmreader.utils.forcecurve import ForceCurve
 #from pyfmreader.utils.segment import Segment
+
+
+def _compute_psnex_force(segment, file_metadata):
+    """
+    Compute force for a PS-NEX segment from raw vDeflection data.
+    
+    For PS-NEX format, force is computed directly from the raw vDeflection (in Volts)
+    using the deflection sensitivity calibration factor:
+    
+        Force (N) = vDeflection (V) * defl_sens (m/V)
+    
+    Parameters:
+    -----------
+    segment : Segment
+        The segment object to compute force for
+    file_metadata : dict
+        File metadata containing deflection sensitivity
+    
+    Returns: None
+        Modifies segment.force in place
+    """
+    # Get deflection sensitivity from metadata (in nm/V)
+    defl_sens_nmbyV = file_metadata.get('defl_sens_nmbyV', None)
+    
+    if defl_sens_nmbyV is None:
+        logger.warning("defl_sens_nmbyV not found in metadata. Force cannot be computed.")
+        return
+    
+    # Convert from nm/V to m/V
+    defl_sens_mbyV = defl_sens_nmbyV / 1e9
+    
+    # Get raw vDeflection from segment
+    if hasattr(segment, 'segment_formated_data') and 'vDeflection' in segment.segment_formated_data:
+        v_deflection = segment.segment_formated_data['vDeflection']
+        
+        # Skip if no data
+        if len(v_deflection) == 0:
+            return
+        
+        # Compute force: Force (N) = vDeflection (V) * defl_sens (m/V)
+        segment.force = v_deflection * defl_sens_mbyV
+    else:
+        logger.debug(f"Segment {segment.segment_id} has no vDeflection data for force computation.")
+
 
 def loadPSNEXcurve(file_metadata,curve_index = 0, 
                    z_sensor_delay = 0, bool_correct_overshoot = False):
@@ -243,6 +288,8 @@ def loadPSNEXcurve(file_metadata,curve_index = 0,
         segment.sampling_rate = segment.segment_metadata[f"segment_{segment_id}_sampling_rate_(S/s)"]
         segment.z_displacement = segment.segment_metadata[f"segment_{segment_id}_Z_retract_length_(V)"]
         
+        # Compute force for PS-NEX segments
+        _compute_psnex_force(segment, file_metadata)
         
         # print(segment.segment_type)
         if segment.segment_type in ["App", "Approach"]:
@@ -296,3 +343,72 @@ def loadPSNEXcurve(file_metadata,curve_index = 0,
         # print ("---------------------")
  
     return force_curve
+
+
+def loadPSNEXcurve_by_index(df_map, curve_index, z_sensor_delay=0, bool_correct_overshoot=False):
+    """
+    Load a single force curve from a PS-NEX map by curve_index from df_map.
+    
+    This function links getcurve() with df_map by using the curve_index to look up
+    the corresponding TDMS file path and load the curve data.
+    
+    Parameters:
+    -----------
+    df_map : pandas.DataFrame
+        Dataframe returned from getpiezoimg() containing curve metadata.
+        Must have columns: ['curve_index', 'filepath']
+    curve_index : int
+        The curve index to load (must exist in df_map)
+    z_sensor_delay : float, optional
+        Z sensor delay value. Default is 0.
+    bool_correct_overshoot : bool, optional
+        Flag indicating whether to correct overshoot. Default is False.
+    
+    Returns:
+    --------
+    force_curve : utils.forcecurve.ForceCurve
+        The loaded force curve object
+    metadata : dict
+        Metadata from the loaded TDMS file
+    filepath : str
+        Path to the TDMS file that was loaded
+    
+    Raises:
+    -------
+    ValueError
+        If curve_index is not found in df_map
+    FileNotFoundError
+        If the TDMS file does not exist
+    """
+    # Import here to avoid circular imports
+    from . import loadpsnexfile
+    from ..uff import UFF
+    
+    # Look up the curve in df_map using curve_index
+    curve_row = df_map[df_map['curve_index'] == curve_index]
+    
+    if len(curve_row) == 0:
+        raise ValueError(f"curve_index {curve_index} not found in df_map")
+    
+    # Get the filepath for this curve
+    filepath = curve_row['filepath'].values[0]
+    
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(f"TDMS file not found: {filepath}")
+    
+    # Create a UFF object and load the file metadata from the TDMS file
+    uff_temp = UFF()
+    loadpsnexfile.loadPSNEXfile(filepath, uff_temp)
+    file_metadata = uff_temp.filemetadata
+    
+    # Get the force curve (index 0 since each TDMS file has exactly 1 curve)
+    force_curve = loadPSNEXcurve(
+        file_metadata, 
+        curve_index=0, 
+        z_sensor_delay=z_sensor_delay,
+        bool_correct_overshoot=bool_correct_overshoot
+    )
+    
+    logger.debug(f"Successfully loaded force curve at curve_index {curve_index} from {os.path.basename(filepath)}")
+    
+    return force_curve, file_metadata, filepath
